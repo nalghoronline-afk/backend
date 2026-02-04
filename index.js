@@ -224,6 +224,15 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
+app.get('/api/users', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const users = await User.find().select('-password');
+        res.json(users);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // 2. Customer Routes
 app.get('/api/customers', authenticate, async (req, res) => {
     try {
