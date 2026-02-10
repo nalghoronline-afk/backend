@@ -8,12 +8,20 @@ const axios = require('axios');
 const cron = require('node-cron');
 const FormData = require('form-data');
 require('dotenv').config();
+// Removal of unused Supabase client
+// const { createClient } = require('@supabase/supabase-js');
+// const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: 'http://localhost:5173', // Allow frontend
+    credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -98,6 +106,13 @@ const customerSchema = new mongoose.Schema({
     ipAddress: String,
     macAddress: String,
 
+    // Charges
+    connectionCharge: { type: Number, default: 0 },
+
+    // MikroTik specific
+    routerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Router' },
+    mikrotikUsername: String, // PPPoE Username
+
     createdAt: { type: Date, default: Date.now }
 });
 const Customer = mongoose.model('Customer', customerSchema);
@@ -108,6 +123,7 @@ const billSchema = new mongoose.Schema({
     month: { type: String, required: true }, // e.g., "January 2026"
     year: { type: Number, required: true },
     amount: { type: Number, required: true },
+    previousDue: { type: Number, default: 0 }, // Customer's due BEFORE this bill
     paidAmount: { type: Number, default: 0 },
     discount: { type: Number, default: 0 },
     status: { type: String, enum: ['unpaid', 'paid', 'partial'], default: 'unpaid' },
@@ -148,6 +164,97 @@ const transactionSchema = new mongoose.Schema({
 });
 const Transaction = mongoose.model('Transaction', transactionSchema);
 
+const net = require('net');
+const { RouterOSAPI } = require('node-routeros');
+
+// 7. MikroTik Router
+const routerSchema = new mongoose.Schema({
+    name: { type: String, required: true },
+    host: { type: String, required: true },
+    port: { type: Number, default: 110 }, // User specified API port 110
+    username: { type: String, required: true },
+    password: { type: String, required: true },
+    isActive: { type: Boolean, default: true },
+    description: String
+});
+const Router = mongoose.model('Router', routerSchema);
+
+// --- MikroTik Integration Helper ---
+const getMikroTikClient = (router) => {
+    return new RouterOSAPI({
+        host: router.host,
+        user: router.username,
+        password: router.password,
+        port: router.port || 8728,
+        timeout: 5000,
+        keepalive: false,
+        tls: (router.port === 8729 || router.port === '8729') ? { rejectUnauthorized: false } : false // Enable TLS with loose verification if port requires it
+    });
+};
+
+const mikrotikAction = async (routerId, action, params = {}) => {
+    try {
+        // Fetch router from MongoDB
+        const router = await Router.findById(routerId);
+
+        if (!router) throw new Error('Router not found in Database');
+
+
+        const client = getMikroTikClient(router);
+        await client.connect();
+
+        let result;
+        switch (action) {
+
+            case 'ping':
+                result = { success: true, message: 'Connected successfully to MikroTik' };
+                break;
+            case 'getActiveUsers':
+                result = await client.menu('/ppp/active').get();
+                break;
+            case 'getAllSecrets':
+                result = await client.menu('/ppp/secret').get();
+                break;
+            case 'enableSecret':
+                // params.name is the pppoe username
+                const secrets = await client.menu('/ppp/secret').get();
+                const secret = secrets.find(s => s.name === params.name);
+                if (secret) {
+                    await client.menu('/ppp/secret').set(secret['.id'], { disabled: 'no' });
+                    result = { success: true, message: `User ${params.name} enabled` };
+                } else {
+                    throw new Error('Secret not found');
+                }
+                break;
+            case 'disableSecret':
+                const secretsToDisable = await client.menu('/ppp/secret').get();
+                const secretToDisable = secretsToDisable.find(s => s.name === params.name);
+                if (secretToDisable) {
+                    await client.menu('/ppp/secret').set(secretToDisable['.id'], { disabled: 'yes' });
+                    // Also kick active session
+                    const activeSessions = await client.menu('/ppp/active').get();
+                    const activeSession = activeSessions.find(s => s.name === params.name);
+                    if (activeSession) {
+                        await client.menu('/ppp/active').remove(activeSession['.id']);
+                    }
+                    result = { success: true, message: `User ${params.name} disabled` };
+                } else {
+                    throw new Error('Secret not found');
+                }
+
+                break;
+            default:
+                throw new Error('Unknown action');
+        }
+
+        await client.close();
+        return result;
+    } catch (err) {
+        console.error('MikroTik Error:', err.message);
+        throw err;
+    }
+};
+
 // --- Helpers & Middleware ---
 
 // Image Upload (Multer Memory Storage)
@@ -168,7 +275,7 @@ const uploadToImageBB = async (buffer) => {
     }
 };
 
-// Auth Middleware
+// Auth Middleware (Restored to JWT)
 const authenticate = (req, res, next) => {
     const token = req.header('Authorization')?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ message: 'Access denied. No token provided.' });
@@ -178,9 +285,12 @@ const authenticate = (req, res, next) => {
         req.user = decoded;
         next();
     } catch (ex) {
+        console.error('Auth Middleware Error:', ex.message);
         res.status(401).json({ message: 'Invalid token.' });
     }
 };
+
+
 
 const authorize = (roles = []) => {
     return (req, res, next) => {
@@ -217,7 +327,7 @@ app.post('/api/auth/login', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
-        const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1d' });
+        const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
         res.json({ token, user: { id: user._id, name: user.name, role: user.role } });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -248,6 +358,20 @@ app.get('/api/customers', authenticate, async (req, res) => {
 app.post('/api/customers', authenticate, async (req, res) => {
     try {
         const { previousDueDetails, ...customerData } = req.body;
+
+        // Check for duplicate name or mobile
+        const existingCustomer = await Customer.findOne({
+            $or: [
+                { mobile: customerData.mobile },
+                { name: customerData.name }
+            ]
+        });
+
+        if (existingCustomer) {
+            const field = existingCustomer.mobile === customerData.mobile ? 'Mobile Number' : 'Customer Name';
+            return res.status(400).json({ message: `${field} already exists in the system.` });
+        }
+
         const customer = new Customer(customerData);
 
         // Calculate initial due from previous details
@@ -273,6 +397,23 @@ app.post('/api/customers', authenticate, async (req, res) => {
         }
 
         customer.currentDue = (customer.currentDue || 0) + initialDue;
+
+        // 2. Handle Connection Charge
+        if (customerData.connectionCharge && Number(customerData.connectionCharge) > 0) {
+            const connCharge = Number(customerData.connectionCharge);
+            const connectionBill = new Bill({
+                customerId: customer._id,
+                month: 'Connection Fee',
+                year: new Date().getFullYear(),
+                amount: connCharge,
+                status: 'unpaid',
+                dueDate: new Date(),
+                generatedAt: new Date()
+            });
+            await connectionBill.save();
+            customer.currentDue += connCharge;
+        }
+
         await customer.save();
         res.status(201).json(customer);
     } catch (err) {
@@ -283,6 +424,22 @@ app.post('/api/customers', authenticate, async (req, res) => {
 app.put('/api/customers/:id', authenticate, async (req, res) => {
     try {
         const { previousDueDetails, ...updateData } = req.body;
+
+        // Check for duplicate name or mobile (excluding current customer)
+        if (updateData.name || updateData.mobile) {
+            const existingCustomer = await Customer.findOne({
+                _id: { $ne: req.params.id },
+                $or: [
+                    ...(updateData.mobile ? [{ mobile: updateData.mobile }] : []),
+                    ...(updateData.name ? [{ name: updateData.name }] : [])
+                ]
+            });
+
+            if (existingCustomer) {
+                const field = existingCustomer.mobile === updateData.mobile ? 'Mobile Number' : 'Customer Name';
+                return res.status(400).json({ message: `${field} already exists for another customer.` });
+            }
+        }
 
         // 1. Handle Previous Due / Opening Balance additions
         let additionalDue = 0;
@@ -367,6 +524,7 @@ app.post('/api/bills/generate-monthly', authenticate, authorize(['admin', 'billi
                     month,
                     year,
                     amount: customer.packagePrice,
+                    previousDue: customer.currentDue || 0,
                     dueDate,
                     status: 'unpaid'
                 });
@@ -395,11 +553,15 @@ app.post('/api/bills', authenticate, authorize(['admin', 'billing_manager']), as
     try {
         const { customerId, month, year, amount, dueDate } = req.body;
 
+        const customer = await Customer.findById(customerId);
+        if (!customer) return res.status(404).json({ message: "Customer not found" });
+
         const bill = new Bill({
             customerId,
             month,
             year,
             amount,
+            previousDue: customer.currentDue || 0,
             dueDate: dueDate || new Date(),
             status: 'unpaid'
         });
@@ -625,6 +787,27 @@ app.post('/api/bills/pay', authenticate, async (req, res) => {
         // Mock SMS Notification (In real app, integrate SMS API here)
         // sendSMS(customerMobile, `Payment of ${amount} received. Thanks.`);
 
+        /*
+        // --- MikroTik Auto-Activation ---
+        const finalCustomer = await Customer.findById(customerId || (transaction ? transaction.customerId : null));
+        if (finalCustomer && finalCustomer.routerId && finalCustomer.mikrotikUsername) {
+            // If they paid via bkash or cleared their due, ensure they are enabled
+            // For now, let's say ANY payment via bkash or any payment that results in low due
+            if (req.body.paymentMethod === 'bkash' || finalCustomer.currentDue <= 0) {
+                try {
+                    await mikrotikAction(finalCustomer.routerId, 'enableSecret', { name: finalCustomer.mikrotikUsername });
+                    // Also ensure status is active in DB
+                    if (finalCustomer.status !== 'active') {
+                        finalCustomer.status = 'active';
+                        await finalCustomer.save();
+                    }
+                } catch (mkErr) {
+                    console.error('Auto-activation failed:', mkErr.message);
+                }
+            }
+        }
+        */
+
         res.json({ message: 'Payment recorded successfully', transaction });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -770,10 +953,14 @@ app.put('/api/transactions/:id', authenticate, authorize(['admin']), async (req,
 
 app.get('/api/transactions', authenticate, async (req, res) => {
     try {
+        const { customerId } = req.query;
+        let query = {};
+        if (customerId) query.customerId = customerId;
+
         // Fetch recent transactions, populated with names
-        const transactions = await Transaction.find()
+        const transactions = await Transaction.find(query)
             .sort({ date: -1 })
-            .limit(50)
+            .limit(customerId ? 100 : 50)
             .populate('customerId', 'name mobile')
             .populate('collectedBy', 'name')
             .populate({
@@ -968,7 +1155,21 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
             { $sort: { "_id": 1 } }
         ]);
 
-        // 6. Customer Zone Chart
+        // 6. Running Month Paid Customers Count
+        const paidCustomersCount = await Bill.countDocuments({
+            month: currentMonthName,
+            year: currentYear,
+            status: 'paid'
+        });
+
+        // 7. Running Month Unpaid Customers Count (Unpaid or Partial)
+        const unpaidCustomersCount = await Bill.countDocuments({
+            month: currentMonthName,
+            year: currentYear,
+            status: { $in: ['unpaid', 'partial'] }
+        });
+
+        // 8. Customer Zone Chart
         // Group customers by area (free text or ID)
         const customerZoneChart = await Customer.aggregate([
             {
@@ -980,12 +1181,13 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
             { $match: { _id: { $ne: null } } } // Exclude nulls
         ]);
 
-
         res.json({
             totalBillGenerated,
             totalMonthlyCollection,
             totalDue,
             runningMonthDue,
+            paidCustomersCount,
+            unpaidCustomersCount,
             monthlyIncomeChart,
             customerZoneChart,
             currentMonth: currentMonthName,
@@ -1210,6 +1412,209 @@ app.delete('/api/inventory/:id', authenticate, authorize(['admin']), async (req,
         res.status(500).json({ error: err.message });
     }
 });
+
+// 7. MikroTik Router Management
+app.get('/api/routers', authenticate, async (req, res) => {
+    try {
+        const routers = await Router.find();
+        res.json(routers);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/routers', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const router = new Router(req.body);
+        await router.save();
+        res.status(201).json(router);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/routers/:id', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const router = await Router.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        res.json(router);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/routers/:id', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        await Router.findByIdAndDelete(req.params.id);
+        res.json({ message: 'Router deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/routers/test', authenticate, async (req, res) => {
+    try {
+        const routers = await Router.find();
+        const results = await Promise.all(routers.map(async (r) => {
+            try {
+                const client = getMikroTikClient(r);
+                await client.connect();
+                await client.disconnect();
+                return { name: r.name, success: true, message: 'Connected' };
+            } catch (err) {
+                return { name: r.name, success: false, message: err.message };
+            }
+        }));
+        res.json(results);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+// MikroTik Live Actions
+app.get('/api/mikrotik/secrets/:routerId', authenticate, async (req, res) => {
+    try {
+        const secrets = await mikrotikAction(req.params.routerId, 'getAllSecrets');
+        res.json(secrets);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/mikrotik/active/:routerId', authenticate, async (req, res) => {
+    try {
+        const active = await mikrotikAction(req.params.routerId, 'getActiveUsers');
+        res.json(active);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/mikrotik/action/:routerId', authenticate, authorize(['admin', 'billing_manager']), async (req, res) => {
+    try {
+        const { action, name } = req.body;
+        const result = await mikrotikAction(req.params.routerId, action, { name });
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Admin Tools & System Utilities (Consolidated from scripts) ---
+
+async function checkPort(host, port) {
+    return new Promise((resolve) => {
+        const socket = new net.Socket();
+        socket.setTimeout(3000);
+        socket.on('connect', () => { socket.destroy(); resolve(true); });
+        socket.on('timeout', () => { socket.destroy(); resolve(false); });
+        socket.on('error', () => { socket.destroy(); resolve(false); });
+        socket.connect(port, host);
+    });
+}
+
+// Reset User Password (Admin only)
+app.post('/api/admin/reset-password', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const { username, newPassword } = req.body;
+        const user = await User.findOne({ username });
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const hashedPassword = await bcrypt.hash(newPassword || '123456', 10);
+        user.password = hashedPassword;
+        await user.save();
+        res.json({ message: `Password for ${username} reset successfully` });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// MikroTik Detailed Diagnosis
+app.get('/api/admin/mikrotik/diagnose/:routerId', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const router = await Router.findById(req.params.routerId);
+        if (!router) return res.status(404).json({ message: 'Router not found' });
+
+        const results = {
+            router: router.name,
+            host: router.host,
+            port: router.port,
+            tcpConnection: false,
+            apiLogin: false,
+            identity: null,
+            error: null
+        };
+
+        // 1. Check TCP
+        results.tcpConnection = await checkPort(router.host, router.port);
+
+        // 2. Check API
+        if (results.tcpConnection) {
+            const client = getMikroTikClient(router);
+            try {
+                await client.connect();
+                results.apiLogin = true;
+                const identity = await client.menu('/system/identity').get();
+                results.identity = identity[0]?.name;
+                await client.close();
+            } catch (err) {
+                results.error = err.message;
+            }
+        } else {
+            results.error = "TCP Port closed or unreachable";
+        }
+
+        res.json(results);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Seed Initial Routers (From seed_router.js)
+app.post('/api/admin/seed-routers', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const router = await Router.findOneAndUpdate(
+            { name: "Main MikroTik" },
+            {
+                name: "Main MikroTik",
+                host: "127.0.0.1",
+                port: 110,
+                username: "admin",
+                password: "password",
+                description: "Default Seeded Router",
+                isActive: true
+            },
+            { upsert: true, new: true }
+        );
+        res.json({ message: 'Router seeded/updated', router });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// System Status Check
+app.get('/api/admin/system/status', authenticate, authorize(['admin']), async (req, res) => {
+    try {
+        const dbStatus = mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected';
+        const userCount = await User.countDocuments();
+        const customerCount = await Customer.countDocuments();
+        const routerCount = await Router.countDocuments();
+
+        res.json({
+            database: dbStatus,
+            counts: {
+                users: userCount,
+                customers: customerCount,
+                routers: routerCount
+            },
+            uptime: process.uptime(),
+            memory: process.memoryUsage()
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 // --- Automations (Cron) ---
 
